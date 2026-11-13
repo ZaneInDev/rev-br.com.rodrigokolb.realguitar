@@ -1,0 +1,7 @@
+decoded-output/
+.gradle/
+temp_extracted_pkg/
+temp_libs/
+temp_ghidra_proj/
+temp_ghidra_home/
+temp_ghidra_tmp/
