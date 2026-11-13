@@ -1,0 +1,133 @@
+name: Universal Decompile and Analysis
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    env:
+      GHIDRA_JOBS: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Install Tools (JADX, Ghidra, GNU Parallel)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip wget parallel
+
+          cd /tmp
+
+          JADX_VERSION=$(curl -s https://api.github.com/repos/skylot/jadx/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          wget -q https://github.com/skylot/jadx/releases/download/v$JADX_VERSION/jadx-$JADX_VERSION.zip
+          mkdir -p $GITHUB_WORKSPACE/jadx-tool
+          unzip -q jadx-$JADX_VERSION.zip -d $GITHUB_WORKSPACE/jadx-tool
+          sudo ln -s $GITHUB_WORKSPACE/jadx-tool/bin/jadx /usr/local/bin/jadx
+
+          GHIDRA_URL=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest | grep "browser_download_url.*_PUBLIC_" | head -n 1 | cut -d '"' -f 4)
+          wget -q "$GHIDRA_URL" -O ghidra.zip
+          mkdir -p $GITHUB_WORKSPACE/ghidra-tool
+          unzip -q ghidra.zip -d $GITHUB_WORKSPACE/ghidra-tool
+          GHIDRA_DIR=$(find "$GITHUB_WORKSPACE/ghidra-tool" -maxdepth 1 -name "ghidra_*" | head -n 1)
+          sudo ln -s "$GHIDRA_DIR/support/analyzeHeadless" /usr/local/bin/analyzeHeadless
+
+          cd $GITHUB_WORKSPACE
+
+      - name: Process Target Package Only
+        run: |
+          mkdir -p decoded-output/java_source
+          mkdir -p decoded-output/lib
+          mkdir -p temp_extracted_pkg
+          mkdir -p temp_ghidra_proj
+          mkdir -p temp_ghidra_home
+          mkdir -p temp_ghidra_tmp
+
+          if [ -z "${GHIDRA_JOBS:-}" ]; then
+            CORES=$(nproc 2>/dev/null || echo 2)
+            JOBS=$(( CORES / 2 ))
+            [ "$JOBS" -lt 1 ] && JOBS=1
+          else
+            JOBS="$GHIDRA_JOBS"
+          fi
+          echo "Using $JOBS concurrent Ghidra worker(s)"
+
+          TARGET_FILE="$(ls -p | grep -v / | grep -E '\.(apk|xapk|apks|zip)$' | head -n 1)"
+          if [ -z "$TARGET_FILE" ]; then
+            echo "Error: Target package file not found!"
+            exit 1
+          fi
+          echo "Processing target package: $TARGET_FILE"
+
+          EXT="${TARGET_FILE##*.}"
+          if [ "$EXT" = "xapk" ] || [ "$EXT" = "apks" ] || [ "$EXT" = "zip" ]; then
+            echo "Unpacking archive bundle..."
+            unzip -q "$TARGET_FILE" -d temp_extracted_pkg
+            find temp_extracted_pkg -name "*.apk" > apk_list.txt
+          else
+            echo "$TARGET_FILE" > apk_list.txt
+          fi
+
+          echo "=== Running JADX Decompilation ==="
+          while IFS= read -r apk; do
+            echo "Decompiling $apk..."
+            jadx -d decoded-output/java_source "$apk" || echo "JADX finished with partial errors on $apk..."
+          done < apk_list.txt
+
+          echo "=== Extracting and Parallely Analyzing Native Libraries (.so) with Ghidra ==="
+          mkdir -p temp_libs
+          while IFS= read -r apk; do
+            if unzip -l "$apk" | grep -q "lib/"; then
+              unzip -q -o "$apk" "lib/*" -d temp_libs || true
+            fi
+          done < apk_list.txt
+
+          if [ -d "temp_libs/lib" ]; then
+            find temp_libs/lib -name "*.so" -exec du -b {} + | sort -n | cut -f2 > so_files.txt
+
+            cat so_files.txt | parallel --jobs "$JOBS" --halt-on-error 0 '
+              SO_FILE={}
+              SO_NAME=$(basename "$SO_FILE")
+              WORKER_ID={#}
+              PROJ_NAME="proj_${WORKER_ID}_${SO_NAME}"
+              export HOME="'$GITHUB_WORKSPACE'/temp_ghidra_home/worker_${WORKER_ID}"
+              export TMPDIR="'$GITHUB_WORKSPACE'/temp_ghidra_tmp/worker_${WORKER_ID}"
+              mkdir -p "$HOME" "$TMPDIR"
+              echo "Analyzing $SO_FILE in parallel (project: $PROJ_NAME)..."
+              analyzeHeadless temp_ghidra_proj "$PROJ_NAME" \
+                -import "$SO_FILE" \
+                -scriptPath "'$GITHUB_WORKSPACE'/ghidra_scripts" \
+                -postScript ExportDecompiled.java \
+                -deleteProject || echo "Headless analysis completed with status codes."
+            '
+            echo "Listing generated files in decoded-output/lib:"
+            ls -la decoded-output/lib || echo "lib directory empty or missing"
+          else
+            echo "No native shared libraries (.so files) present."
+          fi
+
+      - name: Sanitize File Names for Artifact Upload
+        run: |
+          echo "Sanitizing filenames containing NTFS/Artifact forbidden characters..."
+          find decoded-output -depth -name "*[\?:\<\>\"\|]*" | while IFS= read -r file; do
+            dir=$(dirname "$file")
+            base=$(basename "$file")
+            clean_base=$(echo "$base" | tr '\?:\<\>\"\|' '______')
+            mv "$file" "$dir/$clean_base"
+            echo "Sanitized: $base -> $clean_base"
+          done
+
+      - name: Upload Analysis Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+            name: universal-reversing-results
+            path: decoded-output/
+            if-no-files-found: error
